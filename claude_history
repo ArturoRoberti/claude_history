@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+# Copyright 2026 Arturo Roberti
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""List Claude conversation IDs with first/last prompts and optional rich detail."""
+
+import argparse
+import json
+import os
+import sys
+from collections import OrderedDict
+from textwrap import shorten
+
+HISTORY_FILE = os.path.expanduser("~/.claude/history.jsonl")
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
+MAX_MSG_LEN = 120
+
+
+def truncate(text: str, width: int = MAX_MSG_LEN) -> str:
+    return shorten(text.replace("\n", " "), width=width, placeholder="…")
+
+
+def parse_history(path: str) -> OrderedDict:
+    conversations: OrderedDict = OrderedDict()
+    with open(path, encoding="utf-8") as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as e:
+                print(f"Warning: skipping malformed JSON on line {lineno}: {e}", file=sys.stderr)
+                continue
+            if not isinstance(entry, dict):
+                continue
+            sid = entry.get("sessionId") or "unknown"
+            msg = (entry.get("display") or "").strip()
+            ts = entry.get("timestamp") or 0
+            project = entry.get("project") or ""
+            if sid not in conversations:
+                conversations[sid] = {"project": project, "msgs": []}
+            conversations[sid]["msgs"].append((ts, msg))
+
+    for data in conversations.values():
+        data["msgs"].sort(key=lambda x: x[0])
+    return conversations
+
+
+def parse_session_jsonl(sid: str, project: str) -> dict:
+    """Extract enrichment data from the full session JSONL if it exists."""
+    slug = project.replace("/", "-")
+    path = os.path.join(PROJECTS_DIR, slug, sid + ".jsonl")
+    if not os.path.isfile(path):
+        return {}
+
+    files_edited: set = set()
+    files_read: set = set()
+    tools_used: dict = {}  # name -> count
+    git_branch: str | None = None
+    bash_commands: list = []
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if git_branch is None:
+                    git_branch = entry.get("gitBranch")
+
+                msg = entry.get("message", {})
+                if not isinstance(msg, dict):
+                    continue
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+
+                for item in content:
+                    if not isinstance(item, dict) or item.get("type") != "tool_use":
+                        continue
+                    name = item.get("name", "")
+                    inp = item.get("input") or {}
+                    tools_used[name] = tools_used.get(name, 0) + 1
+                    if name in ("Edit", "Write"):
+                        fp = inp.get("file_path", "")
+                        if fp:
+                            files_edited.add(fp)
+                    elif name == "Read":
+                        fp = inp.get("file_path", "")
+                        if fp:
+                            files_read.add(fp)
+                    elif name == "Bash":
+                        cmd = inp.get("command", "")
+                        desc = inp.get("description", "")
+                        if cmd:
+                            bash_commands.append((desc, cmd))
+    except OSError:
+        return {}
+
+    return {
+        "files_edited": sorted(files_edited),
+        "files_read": sorted(files_read),
+        "tools_used": tools_used,
+        "git_branch": git_branch,
+        "bash_commands": bash_commands,
+    }
+
+
+def last_ts(data: dict) -> int:
+    return data["msgs"][-1][0] if data["msgs"] else 0
+
+
+def find_last_conversation(conversations: OrderedDict, project_filter: str | None) -> tuple[str, dict] | None:
+    """Return (sid, data) of the most recently active conversation, optionally filtered by project."""
+    candidates = [
+        (sid, data) for sid, data in conversations.items()
+        if project_filter is None or data["project"] == project_filter
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda x: last_ts(x[1]))
+
+
+def cmd_resume(conversations: OrderedDict, go_global: bool) -> None:
+    project_filter = None if go_global else os.getcwd()
+    result = find_last_conversation(conversations, project_filter)
+
+    if result is None:
+        if project_filter:
+            print(
+                f"No conversations found for {project_filter}.\n"
+                "Use --global to resume the last conversation regardless of directory.",
+                file=sys.stderr,
+            )
+        else:
+            print("No conversations found.", file=sys.stderr)
+        sys.exit(1)
+
+    sid, data = result
+    project = data["project"]
+
+    if go_global and project and os.path.isdir(project) and os.getcwd() != project:
+        os.chdir(project)
+
+    print(f"Resuming {sid}", file=sys.stderr)
+    os.execvp("claude", ["claude", "--resume", sid])
+
+
+def print_conversations(
+    conversations: OrderedDict,
+    show_inputs: bool,
+    show_files: bool,
+    show_tools: bool,
+    show_bash: bool,
+    head: int | None = None,
+    tail: int | None = None,
+) -> None:
+    sep = "─" * 100
+    items = list(conversations.items())
+    if head is not None:
+        items = items[:head]
+    elif tail is not None:
+        items = items[-tail:]
+    for sid, data in items:
+        msgs = data["msgs"]
+        project = data["project"] or "(no project)"
+        enrichment = parse_session_jsonl(sid, data["project"])
+
+        print(sep)
+        print(f"  ID      : {sid}")
+        print(f"  Project : {project}")
+        if enrichment.get("git_branch"):
+            print(f"  Branch  : {enrichment['git_branch']}")
+
+        print(f"  Prompts :")
+        if show_inputs:
+            for i, (_, msg) in enumerate(msgs, 1):
+                print(f"    [{i:>3}] : {truncate(msg)}")
+        else:
+            print(f"    First : {truncate(msgs[0][1])}")
+            if len(msgs) > 1:
+                print(f"    Last  : {truncate(msgs[-1][1])}")
+
+        if show_files and enrichment.get("files_edited"):
+            print(f"  Edited  :")
+            for fp in enrichment["files_edited"]:
+                print(f"    - {fp}")
+
+        if show_tools and enrichment.get("tools_used"):
+            counts = sorted(enrichment["tools_used"].items(), key=lambda x: -x[1])
+            summary = "  ".join(f"{n}×{c}" for n, c in counts)
+            print(f"  Tools   : {summary}")
+
+        if show_bash and enrichment.get("bash_commands"):
+            print(f"  Bash    :")
+            for desc, cmd in enrichment["bash_commands"]:
+                label = desc if desc else truncate(cmd, 90)
+                print(f"    - {label}")
+
+    print(sep)
+    shown = len(items)
+    total = len(conversations)
+    suffix = f" (showing {shown} of {total})" if shown != total else ""
+    print(f"\n{total} conversation(s) total{suffix}.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="List Claude conversations, or resume the last one.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  claude_history                  list all conversations\n"
+            "  claude_history resume           resume last conversation in current dir\n"
+            "  claude_history resume --global  resume last conversation (any dir)\n"
+            "  claude_history -a --tail 5      show full detail for last 5 conversations\n"
+        ),
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # --- resume subcommand ---
+    resume_parser = subparsers.add_parser("resume", help="Resume the last conversation.")
+    resume_parser.add_argument(
+        "-g", "--global", dest="go_global", action="store_true",
+        help="Resume the last conversation regardless of current directory, cd-ing into its project dir.",
+    )
+
+    # --- list flags (on main parser, default when no subcommand) ---
+    parser.add_argument("-i", "--inputs", action="store_true",
+                        help="Show all prompt messages instead of just first and last.")
+    parser.add_argument("-f", "--files", action="store_true",
+                        help="Show files edited/written during the conversation.")
+    parser.add_argument("-t", "--tools", action="store_true",
+                        help="Show tool usage summary.")
+    parser.add_argument("-b", "--bash", action="store_true",
+                        help="Show Bash commands run during the conversation.")
+    parser.add_argument("-a", "--all", action="store_true",
+                        help="Show all prompts, edited files, tools, and bash commands.")
+    parser.add_argument("-n", "--head", type=int, metavar="N",
+                        help="Show only the first N conversations.")
+    parser.add_argument("-l", "--tail", type=int, metavar="N",
+                        help="Show only the last N conversations.")
+
+    args = parser.parse_args()
+
+    # --- shared: load history ---
+    if not os.path.exists(HISTORY_FILE):
+        print(f"Error: history file not found: {HISTORY_FILE}", file=sys.stderr)
+        sys.exit(1)
+    if not os.path.isfile(HISTORY_FILE):
+        print(f"Error: not a file: {HISTORY_FILE}", file=sys.stderr)
+        sys.exit(1)
+    if not os.access(HISTORY_FILE, os.R_OK):
+        print(f"Error: history file not readable: {HISTORY_FILE}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        conversations = parse_history(HISTORY_FILE)
+    except OSError as e:
+        print(f"Error reading history file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not conversations:
+        print("No conversations found.")
+        return
+
+    # --- dispatch ---
+    if args.command == "resume":
+        cmd_resume(conversations, go_global=args.go_global)
+        return
+
+    if args.all:
+        args.inputs = args.files = args.tools = args.bash = True
+    if args.head and args.tail:
+        parser.error("--head and --tail are mutually exclusive.")
+
+    try:
+        print_conversations(
+            conversations,
+            show_inputs=args.inputs,
+            show_files=args.files,
+            show_tools=args.tools,
+            show_bash=args.bash,
+            head=args.head,
+            tail=args.tail,
+        )
+    except BrokenPipeError:
+        sys.stderr.close()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
