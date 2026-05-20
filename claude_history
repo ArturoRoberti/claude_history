@@ -163,6 +163,12 @@ def cmd_resume(conversations: OrderedDict, go_global: bool) -> None:
     os.execvp("claude", ["claude", "--resume", sid])
 
 
+def filter_by_project(conversations: OrderedDict, project: str | None) -> OrderedDict:
+    if project is None:
+        return conversations
+    return OrderedDict((sid, data) for sid, data in conversations.items() if data["project"] == project)
+
+
 def print_conversations(
     conversations: OrderedDict,
     show_inputs: bool,
@@ -227,9 +233,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  claude_history                  list all conversations\n"
-            "  claude_history resume           resume last conversation in current dir\n"
-            "  claude_history resume --global  resume last conversation (any dir)\n"
+            "  claude_history                  list conversations in current directory\n"
+            "  claude_history --global         list conversations from all projects\n"
+            "  claude_history resume               resume last conversation in current dir\n"
+            "  claude_history resume --global      resume last conversation (any dir)\n"
             "  claude_history -a --tail 5      show full detail for last 5 conversations\n"
         ),
     )
@@ -239,11 +246,13 @@ def main() -> None:
     # --- resume subcommand ---
     resume_parser = subparsers.add_parser("resume", help="Resume the last conversation.")
     resume_parser.add_argument(
-        "-g", "--global", dest="go_global", action="store_true",
-        help="Resume the last conversation regardless of current directory, cd-ing into its project dir.",
+        "-g", "--global", dest="go_global", action="store_true", default=argparse.SUPPRESS,
+        help="Resume the last conversation regardless of current directory.",
     )
 
     # --- list flags (on main parser, default when no subcommand) ---
+    parser.add_argument("-g", "--global", dest="go_global", action="store_true",
+                        help="Show/resume conversations from all projects (default: current directory only).")
     parser.add_argument("-i", "--inputs", action="store_true",
                         help="Show all prompt messages instead of just first and last.")
     parser.add_argument("-f", "--files", action="store_true",
@@ -284,6 +293,18 @@ def main() -> None:
 
     # --- dispatch ---
     if args.command == "resume":
+        list_flags = [
+            ("--inputs", args.inputs),
+            ("--files", args.files),
+            ("--tools", args.tools),
+            ("--bash", args.bash),
+            ("--all", args.all),
+            ("--head", args.head),
+            ("--tail", args.tail),
+        ]
+        bad = [name for name, val in list_flags if val]
+        if bad:
+            parser.error(f"{', '.join(bad)} cannot be used with resume")
         cmd_resume(conversations, go_global=args.go_global)
         return
 
@@ -292,9 +313,22 @@ def main() -> None:
     if args.head and args.tail:
         parser.error("--head and --tail are mutually exclusive.")
 
+    project_filter = None if args.go_global else os.getcwd()
+    visible = filter_by_project(conversations, project_filter)
+    if not visible:
+        if project_filter:
+            print(
+                f"No conversations found for {project_filter}.\n"
+                "Use --global to list conversations from all projects.",
+                file=sys.stderr,
+            )
+        else:
+            print("No conversations found.", file=sys.stderr)
+        sys.exit(1)
+
     try:
         print_conversations(
-            conversations,
+            visible,
             show_inputs=args.inputs,
             show_files=args.files,
             show_tools=args.tools,

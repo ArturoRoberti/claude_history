@@ -22,10 +22,11 @@ No non-stdlib dependencies required.
 claude_history [options]
 ```
 
-By default prints each conversation's ID, project directory, and first/last prompt.
+By default prints conversations whose project directory matches the current working directory.
 
 | Flag | Description |
 |------|-------------|
+| `-g`, `--global` | Show conversations from **all** projects, not just the current directory |
 | `-i`, `--inputs` | Show **all** prompts instead of just first and last |
 | `-f`, `--files` | Show files edited/written during the session |
 | `-t`, `--tools` | Show tool usage summary (e.g. `Edit×8  Bash×3`) |
@@ -37,31 +38,31 @@ By default prints each conversation's ID, project directory, and first/last prom
 ### Resume a conversation
 
 ```
-claude_history resume [-g]
+claude_history [--global] resume
+claude_history resume [--global]
 ```
 
-Finds the most recent conversation whose project directory matches the current working directory and runs `claude --resume <id>`.
+Finds the most recent conversation whose project directory matches the current working directory and runs `claude --resume <id>`. Pass `-g`/`--global` (before or after `resume`) to resume across all projects.
 
-| Flag | Description |
-|------|-------------|
-| `-g`, `--global` | Ignore the current directory - resume the most recently active conversation across all projects, `cd`-ing into its project directory first |
-
-> **Note:** `--global` changes the working directory of the `claude_history` process before handing off to `claude`. Your shell's working directory is never affected; the `cd` is only visible to the spawned Claude session.
+> **Note:** When `--global` is used with `resume`, `claude_history` changes its own working directory before handing off to `claude`. Your shell's working directory is never affected.
 
 ## Examples
 
 ```bash
-# List all conversations (compact)
+# List conversations in the current directory
 claude_history
 
-# Full detail for the 3 most recent conversations
+# List all conversations across all projects
+claude_history --global
+
+# Full detail for the 3 most recent conversations in this directory
 claude_history --all --tail 3
 
 # Resume last conversation in the current repo
 claude_history resume
 
 # Resume the globally last conversation (any project)
-claude_history resume --global
+claude_history --global resume
 ```
 
 ## Data sources
