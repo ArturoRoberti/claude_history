@@ -5,14 +5,13 @@ Reads `~/.claude/history.jsonl` and (when available) the full session transcript
 
 ## Installation
 
-Copy the script somewhere on your `$PATH`:
+Download the script somewhere on your `$PATH` and make it executable:
 
 ```bash
-cp claude_history ~/.local/bin/claude_history   # or any directory on $PATH
+# sudo apt install wget
+wget https://raw.githubusercontent.com/ArturoRoberti/claude_history/main/claude_history -O ~/.local/bin/claude_history  # or any directory on $PATH
 chmod +x ~/.local/bin/claude_history
 ```
-
-No non-stdlib dependencies required.
 
 ## Usage
 
