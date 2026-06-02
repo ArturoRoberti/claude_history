@@ -21,7 +21,7 @@ chmod +x ~/.local/bin/claude_history
 claude_history [options]
 ```
 
-By default prints conversations whose project directory matches the current working directory.
+By default prints conversations whose project directory matches the current working directory. Each conversation shows its ID, git branch, and name (user-set) or summary (AI-generated) when available — both can be passed to `resume` as a target.
 
 | Flag | Description |
 |------|-------------|
@@ -37,13 +37,17 @@ By default prints conversations whose project directory matches the current work
 ### Resume a conversation
 
 ```
-claude_history [--global] resume
-claude_history resume [--global]
+claude_history [--global] resume [<target>]
 ```
 
-Finds the most recent conversation whose project directory matches the current working directory and runs `claude --resume <id>`. Pass `-g`/`--global` (before or after `resume`) to resume across all projects.
+Finds the most recent conversation matching the current working directory and runs `claude --resume <id>`.
 
-> **Note:** When `--global` is used with `resume`, `claude_history` changes its own working directory before handing off to `claude`. Your shell's working directory is never affected.
+| Argument | Description |
+|----------|-------------|
+| `-g`, `--global` | Search across all projects (must come **before** `resume`) |
+| `<target>` | ID prefix or name/summary substring — or an integer (`1`=oldest, `-1`=most recent, `-3`=third-to-last) |
+
+> **Note:** When `--global` is used, `claude_history` changes its own working directory before handing off to `claude`. Your shell's working directory is never affected.
 
 ## Examples
 
@@ -55,13 +59,19 @@ claude_history
 claude_history --global
 
 # Full detail for the 3 most recent conversations in this directory
-claude_history --all --tail 3
+claude_history -a --tail 5
 
 # Resume last conversation in the current repo
 claude_history resume
 
 # Resume the globally last conversation (any project)
 claude_history --global resume
+
+# Resume conversation by ID prefix or name/summary
+claude_history resume abc123
+
+# Resume third-to-last conversation
+claude_history resume -3
 ```
 
 ## Data sources
@@ -69,7 +79,7 @@ claude_history --global resume
 | Source | Contents |
 |--------|----------|
 | `~/.claude/history.jsonl` | User prompts, timestamps, session IDs, project paths |
-| `~/.claude/projects/<slug>/<id>.jsonl` | Full transcript: tool calls, file edits, git branch (only present for recent sessions) |
+| `~/.claude/projects/<slug>/<id>.jsonl` | Full transcript: tool calls, file edits, git branch, conversation name/summary (only present for recent sessions) |
 
 # License
 

@@ -18,6 +18,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 from collections import OrderedDict
 from textwrap import shorten
@@ -60,16 +61,18 @@ def parse_history(path: str) -> OrderedDict:
 
 def parse_session_jsonl(sid: str, project: str) -> dict:
     """Extract enrichment data from the full session JSONL if it exists."""
-    slug = project.replace("/", "-")
+    slug = re.sub(r"[^a-zA-Z0-9]", "-", project)
     path = os.path.join(PROJECTS_DIR, slug, sid + ".jsonl")
     if not os.path.isfile(path):
         return {}
 
     files_edited: set = set()
     files_read: set = set()
-    tools_used: dict = {}  # name -> count
+    tools_used: dict = {}
     git_branch: str | None = None
     bash_commands: list = []
+    custom_title: str | None = None
+    ai_title: str | None = None
 
     try:
         with open(path, encoding="utf-8") as f:
@@ -85,6 +88,12 @@ def parse_session_jsonl(sid: str, project: str) -> dict:
                 if git_branch is None:
                     git_branch = entry.get("gitBranch")
 
+                t = entry.get("type")
+                if t == "custom-title":
+                    custom_title = entry.get("customTitle") or custom_title
+                elif t == "ai-title" and ai_title is None:
+                    ai_title = entry.get("aiTitle")
+
                 msg = entry.get("message", {})
                 if not isinstance(msg, dict):
                     continue
@@ -95,18 +104,18 @@ def parse_session_jsonl(sid: str, project: str) -> dict:
                 for item in content:
                     if not isinstance(item, dict) or item.get("type") != "tool_use":
                         continue
-                    name = item.get("name", "")
+                    tool_name = item.get("name", "")
                     inp = item.get("input") or {}
-                    tools_used[name] = tools_used.get(name, 0) + 1
-                    if name in ("Edit", "Write"):
+                    tools_used[tool_name] = tools_used.get(tool_name, 0) + 1
+                    if tool_name in ("Edit", "Write"):
                         fp = inp.get("file_path", "")
                         if fp:
                             files_edited.add(fp)
-                    elif name == "Read":
+                    elif tool_name == "Read":
                         fp = inp.get("file_path", "")
                         if fp:
                             files_read.add(fp)
-                    elif name == "Bash":
+                    elif tool_name == "Bash":
                         cmd = inp.get("command", "")
                         desc = inp.get("description", "")
                         if cmd:
@@ -115,6 +124,8 @@ def parse_session_jsonl(sid: str, project: str) -> dict:
         return {}
 
     return {
+        "custom_title": custom_title,
+        "ai_title": ai_title,
         "files_edited": sorted(files_edited),
         "files_read": sorted(files_read),
         "tools_used": tools_used,
@@ -138,24 +149,80 @@ def find_last_conversation(conversations: OrderedDict, project_filter: str | Non
     return max(candidates, key=lambda x: last_ts(x[1]))
 
 
-def cmd_resume(conversations: OrderedDict, go_global: bool) -> None:
-    project_filter = None if go_global else os.getcwd()
-    result = find_last_conversation(conversations, project_filter)
+def resolve_target(conversations: OrderedDict, target: str) -> tuple[str, dict]:
+    """Resolve a name/ID target to (sid, data). Exits on ambiguity or no match."""
+    if target in conversations:
+        return target, conversations[target]
 
-    if result is None:
-        if project_filter:
-            print(
-                f"No conversations found for {project_filter}.\n"
-                "Use --global to resume the last conversation regardless of directory.",
-                file=sys.stderr,
-            )
-        else:
-            print("No conversations found.", file=sys.stderr)
+    prefix_matches = [s for s in conversations if s.startswith(target)]
+    if len(prefix_matches) == 1:
+        sid = prefix_matches[0]
+        return sid, conversations[sid]
+    if len(prefix_matches) > 1:
+        print(f"Ambiguous ID prefix '{target}': matches {len(prefix_matches)} conversations.", file=sys.stderr)
         sys.exit(1)
 
-    sid, data = result
-    project = data["project"]
+    matched_sid = None
+    for sid, data in conversations.items():
+        enrichment = parse_session_jsonl(sid, data["project"])
+        conv_name = enrichment.get("custom_title") or enrichment.get("ai_title") or ""
+        if conv_name and target.lower() in conv_name.lower():
+            if matched_sid is not None:
+                print(f"Ambiguous name '{target}': multiple conversations match.", file=sys.stderr)
+                sys.exit(1)
+            matched_sid = sid
+    if matched_sid is None:
+        print(f"No conversation found matching '{target}'.", file=sys.stderr)
+        sys.exit(1)
+    return matched_sid, conversations[matched_sid]
 
+
+def cmd_resume(
+    conversations: OrderedDict,
+    go_global: bool,
+    target: str | None = None,
+) -> None:
+    try:
+        nth = int(target) if target is not None else None
+    except ValueError:
+        nth = None
+
+    if nth is not None:
+        project_filter = None if go_global else os.getcwd()
+        candidates = [
+            (sid, data) for sid, data in conversations.items()
+            if project_filter is None or data["project"] == project_filter
+        ]
+        candidates.sort(key=lambda x: last_ts(x[1]))
+        if not candidates:
+            print(
+                f"No conversations found{' for ' + project_filter if project_filter else ''}.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            sid, data = candidates[nth - 1] if nth > 0 else candidates[nth]
+        except IndexError:
+            print(f"Index {nth} out of range (have {len(candidates)} conversations).", file=sys.stderr)
+            sys.exit(1)
+    elif target is not None:
+        sid, data = resolve_target(conversations, target)
+    else:
+        project_filter = None if go_global else os.getcwd()
+        result = find_last_conversation(conversations, project_filter)
+        if result is None:
+            if project_filter:
+                print(
+                    f"No conversations found for {project_filter}.\n"
+                    "Use --global before resume to search all directories.",
+                    file=sys.stderr,
+                )
+            else:
+                print("No conversations found.", file=sys.stderr)
+            sys.exit(1)
+        sid, data = result
+
+    project = data["project"]
     if go_global and project and os.path.isdir(project) and os.getcwd() != project:
         os.chdir(project)
 
@@ -191,6 +258,10 @@ def print_conversations(
 
         print(sep)
         print(f"  ID      : {sid}")
+        if enrichment.get("custom_title"):
+            print(f"  Name    : {enrichment['custom_title']}")
+        elif enrichment.get("ai_title"):
+            print(f"  Summary : {enrichment['ai_title']}")
         print(f"  Project : {project}")
         if enrichment.get("git_branch"):
             print(f"  Branch  : {enrichment['git_branch']}")
@@ -233,21 +304,21 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  claude_history                  list conversations in current directory\n"
-            "  claude_history --global         list conversations from all projects\n"
-            "  claude_history resume               resume last conversation in current dir\n"
-            "  claude_history resume --global      resume last conversation (any dir)\n"
-            "  claude_history -a --tail 5      show full detail for last 5 conversations\n"
+            "  claude_history                       list conversations in current directory\n"
+            "  claude_history -a --tail 5           show full detail for last 5 conversations\n"
+            "  claude_history --global resume       resume last conversation (any dir)\n"
+            "  claude_history resume abc123         resume conversation by ID prefix or name\n"
+            "  claude_history resume -3             resume third-to-last conversation\n"
         ),
     )
 
     subparsers = parser.add_subparsers(dest="command")
 
     # --- resume subcommand ---
-    resume_parser = subparsers.add_parser("resume", help="Resume the last conversation.")
+    resume_parser = subparsers.add_parser("resume", help="Resume a conversation.")
     resume_parser.add_argument(
-        "-g", "--global", dest="go_global", action="store_true", default=argparse.SUPPRESS,
-        help="Resume the last conversation regardless of current directory.",
+        "target", nargs="?", default=None,
+        help="ID prefix, name/summary substring, or integer index (1=oldest, -1=most recent, -3=third-to-last).",
     )
 
     # --- list flags (on main parser, default when no subcommand) ---
@@ -305,7 +376,7 @@ def main() -> None:
         bad = [name for name, val in list_flags if val]
         if bad:
             parser.error(f"{', '.join(bad)} cannot be used with resume")
-        cmd_resume(conversations, go_global=args.go_global)
+        cmd_resume(conversations, go_global=args.go_global, target=args.target)
         return
 
     if args.all:
