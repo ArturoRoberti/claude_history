@@ -26,13 +26,24 @@ By default prints conversations whose project directory matches the current work
 | Flag | Description |
 |------|-------------|
 | `-g`, `--global` | Show conversations from **all** projects, not just the current directory |
-| `-i`, `--inputs` | Show **all** prompts instead of just first and last |
+| `-p`, `--prompts` | Show **all** prompts instead of just first and last |
 | `-f`, `--files` | Show files edited/written during the session |
 | `-t`, `--tools` | Show tool usage summary (e.g. `Edit×8  Bash×3`) |
 | `-b`, `--bash` | Show Bash commands that were run |
-| `-a`, `--all` | Implies `-i -f -t -b` |
+| `-a`, `--all` | Implies `-p -f -t -b` |
 | `-n N`, `--head N` | Show only the first N conversations |
 | `-l N`, `--tail N` | Show only the last N conversations |
+
+### Filter with grep
+
+```
+claude_history [options] grep <grep args>
+```
+
+Lists only conversations whose printed output matches `grep <grep args>`; everything after `grep` is passed straight to your system's `grep` (see `claude_history grep --help`). List options (`-a`, `-p`, `-t`, `-l`, ...) must come **before** `grep` and also widen what is searched, e.g. `-p` searches all prompts and `-b` the Bash commands.
+
+- Each conversation is searched separately, line by line (use `-z` for multi-line patterns).
+- With `-v`/`--invert-match`, only conversations where **nothing** matches are listed.
 
 ### Resume a conversation
 
@@ -60,6 +71,12 @@ claude_history --global
 
 # Full detail for the 3 most recent conversations in this directory
 claude_history -a --tail 5
+
+# Full detail for the last 3 conversations mentioning "docker" or "ros"
+claude_history -a -l 3 grep -e docker -e ros
+
+# Conversations whose prompts never mention "rviz"
+claude_history -p grep -vi rviz
 
 # Resume last conversation in the current repo
 claude_history resume

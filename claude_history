@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 from collections import OrderedDict
 from textwrap import shorten
@@ -236,9 +237,101 @@ def filter_by_project(conversations: OrderedDict, project: str | None) -> Ordere
     return OrderedDict((sid, data) for sid, data in conversations.items() if data["project"] == project)
 
 
+def format_conversation(sid: str, data: dict, show_prompts: bool, show_files: bool, show_tools: bool, show_bash: bool) -> str:
+    msgs = data["msgs"]
+    project = data["project"] or "(no project)"
+    enrichment = parse_session_jsonl(sid, data["project"])
+
+    lines = [f"  ID      : {sid}"]
+    if enrichment.get("custom_title"):
+        lines.append(f"  Name    : {enrichment['custom_title']}")
+    elif enrichment.get("ai_title"):
+        lines.append(f"  Summary : {enrichment['ai_title']}")
+    lines.append(f"  Project : {project}")
+    if enrichment.get("git_branch"):
+        lines.append(f"  Branch  : {enrichment['git_branch']}")
+
+    lines.append("  Prompts :")
+    if show_prompts:
+        for i, (_, msg) in enumerate(msgs, 1):
+            lines.append(f"    [{i:>3}] : {truncate(msg)}")
+    else:
+        lines.append(f"    First : {truncate(msgs[0][1])}")
+        if len(msgs) > 1:
+            lines.append(f"    Last  : {truncate(msgs[-1][1])}")
+
+    if show_files and enrichment.get("files_edited"):
+        lines.append("  Edited  :")
+        lines.extend(f"    - {fp}" for fp in enrichment["files_edited"])
+
+    if show_tools and enrichment.get("tools_used"):
+        counts = sorted(enrichment["tools_used"].items(), key=lambda x: -x[1])
+        lines.append("  Tools   : " + "  ".join(f"{n}×{c}" for n, c in counts))
+
+    if show_bash and enrichment.get("bash_commands"):
+        lines.append("  Bash    :")
+        for desc, cmd in enrichment["bash_commands"]:
+            lines.append(f"    - {desc if desc else truncate(cmd, 90)}")
+
+    return "\n".join(lines)
+
+
+# grep options that consume a value, so the rest of a short-option cluster (e.g. -ev) is not flags
+GREP_VALUE_SHORT_OPTS = set("efmABCdD")
+
+
+def split_grep_invert(grep_args: list[str]) -> tuple[list[str], bool]:
+    """Remove -v/--invert-match from the grep args (we invert per conversation, not per line)."""
+    out: list[str] = []
+    invert = False
+    for i, arg in enumerate(grep_args):
+        if arg == "--":
+            out.extend(grep_args[i:])
+            break
+        if arg == "--invert-match":
+            invert = True
+        elif arg.startswith("-") and not arg.startswith("--") and len(arg) > 1:
+            cluster = ""
+            for j, ch in enumerate(arg[1:]):
+                if ch == "v":
+                    invert = True
+                    continue
+                cluster += ch
+                if ch in GREP_VALUE_SHORT_OPTS:
+                    cluster += arg[j + 2:]
+                    break
+            if cluster:
+                out.append("-" + cluster)
+        else:
+            out.append(arg)
+    return out, invert
+
+
+def filter_by_grep(conversations: OrderedDict, grep_args: list[str], **display: bool) -> OrderedDict:
+    """Keep conversations whose printed output matches `grep <grep_args>` (no match at all, with -v)."""
+    grep_args, invert = split_grep_invert(grep_args)
+    result: OrderedDict = OrderedDict()
+    for sid, data in conversations.items():
+        text = format_conversation(sid, data, **display)
+        try:
+            proc = subprocess.run(
+                ["grep", "-q", *grep_args], input=text.encode("utf-8"),
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            print("Error: 'grep' not found on PATH.", file=sys.stderr)
+            sys.exit(1)
+        if proc.returncode == 2:
+            sys.stderr.write(proc.stderr.decode("utf-8", errors="replace"))
+            sys.exit(2)
+        if (proc.returncode == 0) != invert:
+            result[sid] = data
+    return result
+
+
 def print_conversations(
     conversations: OrderedDict,
-    show_inputs: bool,
+    show_prompts: bool,
     show_files: bool,
     show_tools: bool,
     show_bash: bool,
@@ -252,44 +345,8 @@ def print_conversations(
     elif tail is not None:
         items = items[-tail:]
     for sid, data in items:
-        msgs = data["msgs"]
-        project = data["project"] or "(no project)"
-        enrichment = parse_session_jsonl(sid, data["project"])
-
         print(sep)
-        print(f"  ID      : {sid}")
-        if enrichment.get("custom_title"):
-            print(f"  Name    : {enrichment['custom_title']}")
-        elif enrichment.get("ai_title"):
-            print(f"  Summary : {enrichment['ai_title']}")
-        print(f"  Project : {project}")
-        if enrichment.get("git_branch"):
-            print(f"  Branch  : {enrichment['git_branch']}")
-
-        print(f"  Prompts :")
-        if show_inputs:
-            for i, (_, msg) in enumerate(msgs, 1):
-                print(f"    [{i:>3}] : {truncate(msg)}")
-        else:
-            print(f"    First : {truncate(msgs[0][1])}")
-            if len(msgs) > 1:
-                print(f"    Last  : {truncate(msgs[-1][1])}")
-
-        if show_files and enrichment.get("files_edited"):
-            print(f"  Edited  :")
-            for fp in enrichment["files_edited"]:
-                print(f"    - {fp}")
-
-        if show_tools and enrichment.get("tools_used"):
-            counts = sorted(enrichment["tools_used"].items(), key=lambda x: -x[1])
-            summary = "  ".join(f"{n}×{c}" for n, c in counts)
-            print(f"  Tools   : {summary}")
-
-        if show_bash and enrichment.get("bash_commands"):
-            print(f"  Bash    :")
-            for desc, cmd in enrichment["bash_commands"]:
-                label = desc if desc else truncate(cmd, 90)
-                print(f"    - {label}")
+        print(format_conversation(sid, data, show_prompts, show_files, show_tools, show_bash))
 
     print(sep)
     shown = len(items)
@@ -309,6 +366,7 @@ def main() -> None:
             "  claude_history --global resume       resume last conversation (any dir)\n"
             "  claude_history resume abc123         resume conversation by ID prefix or name\n"
             "  claude_history resume -3             resume third-to-last conversation\n"
+            "  claude_history -a -l 3 grep foo      full detail for last 3 conversations matching 'foo'\n"
         ),
     )
 
@@ -321,10 +379,16 @@ def main() -> None:
         help="ID prefix, name/summary substring, or integer index (1=oldest, -1=most recent, -3=third-to-last).",
     )
 
+    # --- grep subcommand (list flags go before it; everything after it is passed to grep) ---
+    subparsers.add_parser(
+        "grep", add_help=False,
+        help="Only list conversations whose output matches 'grep <args>'.",
+    )
+
     # --- list flags (on main parser, default when no subcommand) ---
     parser.add_argument("-g", "--global", dest="go_global", action="store_true",
                         help="Show/resume conversations from all projects (default: current directory only).")
-    parser.add_argument("-i", "--inputs", action="store_true",
+    parser.add_argument("-p", "--prompts", action="store_true",
                         help="Show all prompt messages instead of just first and last.")
     parser.add_argument("-f", "--files", action="store_true",
                         help="Show files edited/written during the conversation.")
@@ -339,7 +403,15 @@ def main() -> None:
     parser.add_argument("-l", "--tail", type=int, metavar="N",
                         help="Show only the last N conversations.")
 
-    args = parser.parse_args()
+    # Everything after "grep" belongs to grep, so split it off before argparse sees it
+    argv = sys.argv[1:]
+    grep_args: list[str] = []
+    cmd_idx = next((i for i, a in enumerate(argv) if a in ("resume", "grep")), None)
+    if cmd_idx is not None and argv[cmd_idx] == "grep":
+        argv, grep_args = argv[:cmd_idx + 1], argv[cmd_idx + 1:]
+        if "--help" in grep_args:
+            os.execvp("grep", ["grep", "--help"])
+    args = parser.parse_args(argv)
 
     # --- shared: load history ---
     if not os.path.exists(HISTORY_FILE):
@@ -365,7 +437,7 @@ def main() -> None:
     # --- dispatch ---
     if args.command == "resume":
         list_flags = [
-            ("--inputs", args.inputs),
+            ("--prompts", args.prompts),
             ("--files", args.files),
             ("--tools", args.tools),
             ("--bash", args.bash),
@@ -380,7 +452,7 @@ def main() -> None:
         return
 
     if args.all:
-        args.inputs = args.files = args.tools = args.bash = True
+        args.prompts = args.files = args.tools = args.bash = True
     if args.head and args.tail:
         parser.error("--head and --tail are mutually exclusive.")
 
@@ -397,10 +469,19 @@ def main() -> None:
             print("No conversations found.", file=sys.stderr)
         sys.exit(1)
 
+    if args.command == "grep":
+        visible = filter_by_grep(
+            visible, grep_args,
+            show_prompts=args.prompts, show_files=args.files, show_tools=args.tools, show_bash=args.bash,
+        )
+        if not visible:
+            print("No conversations match.", file=sys.stderr)
+            sys.exit(1)
+
     try:
         print_conversations(
             visible,
-            show_inputs=args.inputs,
+            show_prompts=args.prompts,
             show_files=args.files,
             show_tools=args.tools,
             show_bash=args.bash,
